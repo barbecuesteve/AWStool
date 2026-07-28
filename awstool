@@ -1,0 +1,424 @@
+#!/usr/bin/env python3
+"""awstool - stand up a new project from scratch.
+
+Usage:
+  awstool onboard [--with-repo] [--with-account] [--with-staging-account]
+                  [--name NAME] [--profile PROFILE] [--dry-run] [--yes]
+
+Steps (each opt-in via flag):
+  --with-repo             git init (if needed), create GitHub repo under
+                          "barbecuesteve", add remote, push.
+  --with-account          Create an AWS Organizations OU named after the
+                          project and a "<name>-prod" account inside it.
+  --with-staging-account  Also create a "<name>-staging" account in the OU
+                          (implies the OU from --with-account).
+
+  New accounts get matching profiles appended to ~/.aws/config
+  (OrganizationAccountAccessRole via the management profile), and a quick
+  reference section of aws/gh/awsconsole commands is appended to README.md
+  before the initial push so it lands in the repo.
+
+  --dry-run               Run read-only preflight checks and print every
+                          command that would be executed, without changes.
+"""
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+GITHUB_OWNER = "barbecuesteve"
+POLL_INTERVAL_SECONDS = 5
+POLL_TIMEOUT_SECONDS = 300
+AWS_CONFIG_PATH = Path.home() / ".aws" / "config"
+
+
+# ---------------------------------------------------------------- utilities
+
+def run(cmd, capture=True, check=True):
+    """Run a command; return CompletedProcess."""
+    return subprocess.run(
+        cmd, capture_output=capture, text=True, check=check
+    )
+
+
+def run_json(cmd):
+    return json.loads(run(cmd).stdout)
+
+
+def shell_repr(cmd):
+    def q(a):
+        return f"'{a}'" if (" " in a or '"' in a) else a
+    return " ".join(q(a) for a in cmd)
+
+
+def die(msg):
+    print(f"error: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def prompt(question, default=None):
+    suffix = f" [{default}]" if default else ""
+    answer = input(f"{question}{suffix}: ").strip()
+    return answer or default or ""
+
+
+def confirm(question, assume_yes=False):
+    if assume_yes:
+        print(f"{question} [y/N]: y (--yes)")
+        return True
+    return input(f"{question} [y/N]: ").strip().lower() in ("y", "yes")
+
+
+class Plan:
+    """Collects actions; prints them in dry-run, executes them otherwise."""
+
+    def __init__(self, dry_run):
+        self.dry_run = dry_run
+        self._n = 0
+
+    def execute(self, description, cmd=None, fn=None, detail=None):
+        """cmd: a CLI command list. fn: a python callable (for composite
+        steps like poll loops). detail: extra text to display (e.g. file
+        content to be written). Returns CompletedProcess/fn result, or None
+        in dry-run."""
+        self._n += 1
+        print(f"\n[{self._n}] {description}")
+        if cmd is not None:
+            print(f"    $ {shell_repr(cmd)}")
+        if detail:
+            for line in detail.rstrip("\n").splitlines():
+                print(f"    | {line}")
+        if self.dry_run:
+            print("    (dry-run: skipped)")
+            return None
+        if fn is not None:
+            return fn()
+        return run(cmd)
+
+
+# ---------------------------------------------------------------- preflight
+
+def check_binaries(need_gh, need_aws):
+    for binary, needed in (("git", need_gh), ("gh", need_gh), ("aws", need_aws)):
+        if needed and run(["which", binary], check=False).returncode != 0:
+            die(f"required tool not found on PATH: {binary}")
+
+
+def gh_preflight(name):
+    auth = run(["gh", "auth", "status"], check=False)
+    if auth.returncode != 0:
+        die("gh is not authenticated; run: gh auth login")
+    exists = run(
+        ["gh", "repo", "view", f"{GITHUB_OWNER}/{name}"], check=False
+    ).returncode == 0
+    if exists:
+        die(f"repo {GITHUB_OWNER}/{name} already exists on GitHub")
+    print(f"  ok: gh authenticated; {GITHUB_OWNER}/{name} is available")
+
+
+def aws_preflight(profile, name):
+    ident = run(
+        ["aws", "sts", "get-caller-identity", "--profile", profile,
+         "--output", "json"], check=False)
+    if ident.returncode != 0:
+        die(f"AWS credentials for profile '{profile}' are not working:\n"
+            f"{ident.stderr.strip()}")
+    account = json.loads(ident.stdout)["Account"]
+
+    org = run(["aws", "organizations", "describe-organization",
+               "--profile", profile, "--output", "json"], check=False)
+    if org.returncode != 0:
+        die(f"profile '{profile}' cannot access AWS Organizations:\n"
+            f"{org.stderr.strip()}")
+    mgmt = json.loads(org.stdout)["Organization"]["MasterAccountId"]
+    if account != mgmt:
+        die(f"profile '{profile}' is account {account}, but the org "
+            f"management account is {mgmt}; account creation must run "
+            f"from the management account")
+
+    root_id = run_json(
+        ["aws", "organizations", "list-roots", "--profile", profile,
+         "--output", "json"])["Roots"][0]["Id"]
+
+    existing_ous = run_json(
+        ["aws", "organizations", "list-organizational-units-for-parent",
+         "--parent-id", root_id, "--profile", profile, "--output", "json"]
+    )["OrganizationalUnits"]
+    clash = next((ou for ou in existing_ous if ou["Name"] == name), None)
+    if clash:
+        die(f"an OU named '{name}' already exists under root ({clash['Id']})")
+
+    mgmt_email = json.loads(org.stdout)["Organization"]["MasterAccountEmail"]
+    print(f"  ok: management account {mgmt}, root {root_id}, "
+          f"no OU named '{name}'")
+    return root_id, mgmt_email
+
+
+def config_preflight(name, envs):
+    text = AWS_CONFIG_PATH.read_text() if AWS_CONFIG_PATH.exists() else ""
+    for env in envs:
+        pname = f"{name.lower()}-{env}"
+        if re.search(rf"(?m)^\[profile {re.escape(pname)}\]", text):
+            die(f"profile '{pname}' already exists in {AWS_CONFIG_PATH}")
+    print(f"  ok: no profile name collisions in {AWS_CONFIG_PATH}")
+
+
+def default_account_email(mgmt_email, name, env):
+    """barbecuesteve@gmail.com -> barbecuesteve+name-env@gmail.com"""
+    local, _, domain = mgmt_email.partition("@")
+    local = local.split("+")[0]
+    return f"{local}+{name}-{env}@{domain}"
+
+
+# ------------------------------------------------------------------- steps
+
+def do_repo(plan, name, cwd, visibility, description):
+    if not (cwd / ".git").is_dir():
+        plan.execute("Initialize local git repository",
+                     cmd=["git", "init", str(cwd)])
+
+    has_commit = (cwd / ".git").is_dir() and run(
+        ["git", "-C", str(cwd), "rev-parse", "HEAD"], check=False
+    ).returncode == 0
+    if not has_commit:
+        # README.md is guaranteed to exist by the docs step, which runs first
+        plan.execute(
+            "Create initial commit",
+            fn=lambda: (
+                run(["git", "-C", str(cwd), "add", "-A"]),
+                run(["git", "-C", str(cwd), "commit", "-m",
+                     "Initial commit"]),
+            ),
+            cmd=["git", "add", "-A", "&&", "git", "commit", "-m",
+                 "Initial commit"])
+
+    create_cmd = ["gh", "repo", "create", f"{GITHUB_OWNER}/{name}",
+                  f"--{visibility}", "--source", str(cwd),
+                  "--remote", "origin", "--push"]
+    if description:
+        create_cmd += ["--description", description]
+    plan.execute(
+        f"Create GitHub repo {GITHUB_OWNER}/{name} ({visibility}), "
+        f"add remote 'origin', push", cmd=create_cmd)
+
+
+def create_account_and_wait(plan, profile, account_name, email,
+                            root_id, get_ou_id):
+    """Create one member account, poll until done, move it into the OU."""
+    create_cmd = ["aws", "organizations", "create-account",
+                  "--profile", profile, "--output", "json",
+                  "--email", email, "--account-name", account_name]
+
+    def fn():
+        status = run_json(create_cmd)["CreateAccountStatus"]
+        req_id = status["Id"]
+        deadline = time.time() + POLL_TIMEOUT_SECONDS
+        while status["State"] == "IN_PROGRESS":
+            if time.time() > deadline:
+                die(f"timed out waiting for account '{account_name}' "
+                    f"(request {req_id}); check with: aws organizations "
+                    f"describe-create-account-status "
+                    f"--create-account-request-id {req_id}")
+            time.sleep(POLL_INTERVAL_SECONDS)
+            status = run_json(
+                ["aws", "organizations", "describe-create-account-status",
+                 "--profile", profile, "--output", "json",
+                 "--create-account-request-id", req_id]
+            )["CreateAccountStatus"]
+        if status["State"] != "SUCCEEDED":
+            die(f"account creation failed: "
+                f"{status.get('FailureReason', 'unknown reason')}")
+        account_id = status["AccountId"]
+        print(f"    created account {account_id}")
+        run(["aws", "organizations", "move-account", "--profile", profile,
+             "--account-id", account_id,
+             "--source-parent-id", root_id,
+             "--destination-parent-id", get_ou_id()])
+        print(f"    moved {account_id} into OU {get_ou_id()}")
+        return account_id
+
+    return plan.execute(
+        f"Create AWS account '{account_name}' ({email}), wait for "
+        f"completion, move it into the project OU",
+        cmd=create_cmd, fn=fn)
+
+
+def do_aws(plan, profile, name, root_id, emails, envs, region):
+    ou_id_holder = {}
+
+    def create_ou():
+        ou = run_json(
+            ["aws", "organizations", "create-organizational-unit",
+             "--profile", profile, "--output", "json",
+             "--parent-id", root_id, "--name", name]
+        )["OrganizationalUnit"]
+        ou_id_holder["id"] = ou["Id"]
+        print(f"    created OU {ou['Id']}")
+        return ou
+
+    plan.execute(
+        f"Create OU '{name}' under root {root_id}",
+        cmd=["aws", "organizations", "create-organizational-unit",
+             "--profile", profile, "--parent-id", root_id, "--name", name],
+        fn=create_ou)
+
+    ids = {}
+    for env in envs:
+        account_id = create_account_and_wait(
+            plan, profile, f"{name}-{env}", emails[env], root_id,
+            get_ou_id=lambda: ou_id_holder.get("id", "<new-ou-id>"))
+        ids[env] = account_id or f"<{env}-account-id>"
+
+        pname = f"{name.lower()}-{env}"
+        block = (f"\n[profile {pname}]\n"
+                 f"role_arn = arn:aws:iam::{ids[env]}:role/"
+                 f"OrganizationAccountAccessRole\n"
+                 f"source_profile = {profile}\n"
+                 f"region = {region}\n")
+        plan.execute(
+            f"Add profile '{pname}' to {AWS_CONFIG_PATH}",
+            detail=block,
+            fn=lambda b=block: AWS_CONFIG_PATH.open("a").write(b))
+    return ids
+
+
+def do_docs(plan, name, cwd, with_repo, with_account, ids, envs, region):
+    lines = [f"## Quick reference",
+             "",
+             f"Provisioned by awstool onboard on {time.strftime('%Y-%m-%d')}.",
+             ""]
+    if with_account:
+        for env in envs:
+            lines.append(f"- {env}: AWS account {ids[env]}, "
+                         f"CLI profile `{name.lower()}-{env}` "
+                         f"(region {region})")
+        lines += [
+            f"- Verify access: `aws --profile {name.lower()}-prod "
+            f"sts get-caller-identity`",
+            f"- Open web console: `awsconsole {name}-prod` "
+            f"(matches the Organizations account name)",
+            f"- Accounts live in the '{name}' OU; org-level changes run "
+            f"from the management account (profile `default`)",
+        ]
+    if with_repo:
+        lines.append(f"- Repo: https://github.com/{GITHUB_OWNER}/{name} "
+                     f"(`gh repo view {GITHUB_OWNER}/{name} --web`)")
+    section = "\n".join(lines) + "\n"
+
+    readme = cwd / "README.md"
+    def fn():
+        prefix = f"# {name}\n\n" if not readme.exists() else "\n"
+        with readme.open("a") as f:
+            f.write(prefix + section)
+
+    plan.execute(f"Append quick-reference section to {readme}",
+                 detail=section, fn=fn)
+
+
+# -------------------------------------------------------------------- main
+
+def cmd_onboard(args):
+    cwd = Path.cwd()
+    name = args.name or cwd.name
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name):
+        die(f"'{name}' is not usable as a repo/OU name; pass --name")
+
+    if args.with_staging_account:
+        args.with_account = True
+    if not (args.with_repo or args.with_account):
+        die("nothing to do; pass --with-repo and/or --with-account "
+            "(--with-staging-account implies --with-account)")
+
+    mode = "DRY RUN" if args.dry_run else "EXECUTE"
+    print(f"== awstool onboard: '{name}' ({mode}) ==\n")
+
+    # ---- preflight (read-only, runs even in dry-run) ----
+    print("Preflight checks:")
+    check_binaries(args.with_repo, args.with_account)
+    if args.with_repo:
+        gh_preflight(name)
+    root_id = mgmt_email = None
+    region = "us-west-2"
+    envs = ["prod"] + (["staging"] if args.with_staging_account else [])
+    if args.with_account:
+        root_id, mgmt_email = aws_preflight(args.profile, name)
+        config_preflight(name, envs)
+        r = run(["aws", "configure", "get", "region",
+                 "--profile", args.profile], check=False)
+        region = r.stdout.strip() or "us-west-2"
+
+    # ---- gather inputs ----
+    visibility = description = None
+    emails = {}
+    if args.with_repo:
+        visibility = prompt("Repo visibility (public/private)",
+                            default="private")
+        if visibility not in ("public", "private"):
+            die("visibility must be 'public' or 'private'")
+        description = prompt("Repo description (optional)", default="")
+    if args.with_account:
+        for env in envs:
+            emails[env] = prompt(
+                f"Email for the {env} account (must be unique across "
+                f"all AWS accounts)",
+                default=default_account_email(mgmt_email, name, env))
+
+    # ---- build & run plan ----
+    plan = Plan(dry_run=args.dry_run)
+    print("\nPlanned changes:" if args.dry_run else "\nExecuting:")
+
+    if args.with_account and not args.dry_run:
+        print(f"\nAbout to create {len(envs)} AWS account(s): "
+              + ", ".join(f"{name}-{e} <{emails[e]}>" for e in envs))
+        print("Note: AWS accounts cannot be deleted, only closed, and "
+              "closed accounts count against org quotas for 90 days.")
+        if not confirm("Proceed with account creation?", args.yes):
+            die("aborted")
+
+    ids = {}
+    if args.with_account:
+        ids = do_aws(plan, args.profile, name, root_id, emails, envs, region)
+    do_docs(plan, name, cwd, args.with_repo, args.with_account,
+            ids, envs, region)
+    if args.with_repo:
+        do_repo(plan, name, cwd, visibility, description)
+
+    print(f"\n{'Dry run complete; no changes made.' if args.dry_run else 'Done.'}")
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="awstool")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("onboard", help="stand up a new project")
+    p.add_argument("--with-repo", action="store_true",
+                   help=f"create GitHub repo under '{GITHUB_OWNER}' and push")
+    p.add_argument("--with-account", action="store_true",
+                   help="create an Organizations OU and a prod account")
+    p.add_argument("--with-staging-account", action="store_true",
+                   help="also create a staging account (implies --with-account)")
+    p.add_argument("--name", help="project name (default: folder name)")
+    p.add_argument("--profile", default="default",
+                   help="AWS profile to use (default: default)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="print planned changes without making them")
+    p.add_argument("--yes", action="store_true",
+                   help="skip confirmation prompts")
+    p.set_defaults(func=cmd_onboard)
+
+    args = parser.parse_args()
+    try:
+        args.func(args)
+    except subprocess.CalledProcessError as e:
+        die(f"command failed: {shell_repr(e.cmd)}\n{(e.stderr or '').strip()}")
+    except KeyboardInterrupt:
+        print()
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()
