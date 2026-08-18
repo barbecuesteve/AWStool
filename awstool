@@ -9,8 +9,10 @@ Usage:
 Run with no --with-* flags to be prompted for each step interactively.
 
 Steps (each opt-in via flag or prompt):
-  repo      git init (if needed), create GitHub repo under "barbecuesteve",
-            add remote, push.
+  repo      git init (if needed), create the GitHub repo, add remote,
+            push. The owner comes from --owner, defaulting to the
+            authenticated gh user; pass an organization name to create the
+            repo there instead.
   account   Create an AWS Organizations OU named after the project and a
             "<name>-prod" account inside it; append a matching profile to
             ~/.aws/config (OrganizationAccountAccessRole via the management
@@ -34,12 +36,12 @@ it would write, without making changes.
 import argparse
 import json
 import re
+import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
 
-GITHUB_OWNER = "barbecuesteve"
 POLL_INTERVAL_SECONDS = 5
 POLL_TIMEOUT_SECONDS = 300
 AWS_CONFIG_PATH = Path.home() / ".aws" / "config"
@@ -117,16 +119,28 @@ def check_binaries(binaries):
             die(f"required tool not found on PATH: {binary}")
 
 
-def gh_preflight(name):
+def resolve_owner(explicit):
+    """GitHub owner for the new repo: --owner, else the authenticated user."""
+    if explicit:
+        return explicit
+    result = run(["gh", "api", "user", "--jq", ".login"], check=False)
+    login = result.stdout.strip()
+    if result.returncode != 0 or not login:
+        die("could not determine the GitHub owner; run 'gh auth login' or "
+            "pass --owner OWNER")
+    return login
+
+
+def gh_preflight(owner, name):
     auth = run(["gh", "auth", "status"], check=False)
     if auth.returncode != 0:
         die("gh is not authenticated; run: gh auth login")
     exists = run(
-        ["gh", "repo", "view", f"{GITHUB_OWNER}/{name}"], check=False
+        ["gh", "repo", "view", f"{owner}/{name}"], check=False
     ).returncode == 0
     if exists:
-        die(f"repo {GITHUB_OWNER}/{name} already exists on GitHub")
-    print(f"  ok: gh authenticated; {GITHUB_OWNER}/{name} is available")
+        die(f"repo {owner}/{name} already exists on GitHub")
+    print(f"  ok: gh authenticated; {owner}/{name} is available")
 
 
 def aws_preflight(profile, name):
@@ -201,7 +215,11 @@ def cdk_preflight(cwd, dry_run):
 
 
 def default_account_email(mgmt_email, name, env):
-    """barbecuesteve@gmail.com -> barbecuesteve+name-env@gmail.com"""
+    """you@example.com -> you+name-env@example.com
+
+    Plus-addressing works on Gmail and most major providers, but not all;
+    the address is prompted, so it can be overridden.
+    """
     local, _, domain = mgmt_email.partition("@")
     local = local.split("+")[0]
     return f"{local}+{name}-{env}@{domain}"
@@ -432,7 +450,7 @@ def detect_stack(cwd, lang):
 
 # ------------------------------------------------------------------- steps
 
-def do_repo(plan, name, cwd, visibility, description):
+def do_repo(plan, owner, name, cwd, visibility, description):
     if not (cwd / ".git").is_dir():
         plan.execute("Initialize local git repository",
                      cmd=["git", "init", str(cwd)])
@@ -452,13 +470,13 @@ def do_repo(plan, name, cwd, visibility, description):
             cmd=["git", "add", "-A", "&&", "git", "commit", "-m",
                  "Initial commit"])
 
-    create_cmd = ["gh", "repo", "create", f"{GITHUB_OWNER}/{name}",
+    create_cmd = ["gh", "repo", "create", f"{owner}/{name}",
                   f"--{visibility}", "--source", str(cwd),
                   "--remote", "origin", "--push"]
     if description:
         create_cmd += ["--description", description]
     plan.execute(
-        f"Create GitHub repo {GITHUB_OWNER}/{name} ({visibility}), "
+        f"Create GitHub repo {owner}/{name} ({visibility}), "
         f"add remote 'origin', push", cmd=create_cmd)
 
 
@@ -522,6 +540,12 @@ def do_aws(plan, profile, name, root_id, emails, envs, region):
              "--profile", profile, "--parent-id", root_id, "--name", name],
         fn=create_ou)
 
+    if AWS_CONFIG_PATH.exists():
+        backup = AWS_CONFIG_PATH.parent / (AWS_CONFIG_PATH.name + ".bak")
+        plan.execute(
+            f"Back up {AWS_CONFIG_PATH} to {backup} before appending",
+            fn=lambda: shutil.copy2(AWS_CONFIG_PATH, backup))
+
     ids = {}
     for env in envs:
         account_id = create_account_and_wait(
@@ -542,8 +566,8 @@ def do_aws(plan, profile, name, root_id, emails, envs, region):
     return ids
 
 
-def do_cdk(plan, cwd, name, ids, envs, region, lang, with_account, with_ci,
-           cdk_cmd, fresh, holder):
+def do_cdk(plan, cwd, owner, name, ids, envs, region, lang, with_account,
+           with_ci, cdk_cmd, fresh, holder):
     ts = lang == "typescript"
     if fresh:
         plan.execute(
@@ -603,7 +627,7 @@ def do_cdk(plan, cwd, name, ids, envs, region, lang, with_account, with_ci,
         if oidc_path.exists():
             print(f"    note: {oidc_path} exists; leaving it alone")
         else:
-            content = (oidc_ts if ts else oidc_py)(f"{GITHUB_OWNER}/{name}")
+            content = (oidc_ts if ts else oidc_py)(f"{owner}/{name}")
             plan.execute(
                 f"Write {oidc_path} (OIDC provider + GitHubDeployRole)",
                 detail=content,
@@ -667,7 +691,7 @@ def do_ci(plan, cwd, name, ids, envs, region, lang, cdk_cmd, fresh, holder):
     plan.execute(f"Write {wf_path}", detail=content, fn=fn)
 
 
-def do_docs(plan, name, cwd, sel, ids, envs, region, holder):
+def do_docs(plan, owner, name, cwd, sel, ids, envs, region, holder):
     lines = ["## Quick reference",
              "",
              f"Provisioned by awstool onboard on {time.strftime('%Y-%m-%d')}.",
@@ -699,8 +723,8 @@ def do_docs(plan, name, cwd, sel, ids, envs, region, holder):
             "in each account (no stored keys)",
         ]
     if sel["repo"]:
-        lines.append(f"- Repo: https://github.com/{GITHUB_OWNER}/{name} "
-                     f"(`gh repo view {GITHUB_OWNER}/{name} --web`)")
+        lines.append(f"- Repo: https://github.com/{owner}/{name} "
+                     f"(`gh repo view {owner}/{name} --web`)")
     section = "\n".join(lines) + "\n"
 
     readme = cwd / "README.md"
@@ -755,17 +779,22 @@ def cmd_onboard(args):
     binaries = (["git", "gh"] if args.with_repo else [])
     binaries += (["aws"] if args.with_account else [])
     check_binaries(binaries)
+    owner = None
     if args.with_repo:
-        gh_preflight(name)
+        owner = resolve_owner(args.owner)
+        gh_preflight(owner, name)
     root_id = mgmt_email = None
-    region = "us-west-2"
+    region = args.region or "us-west-2"
     envs = ["prod"] + (["staging"] if args.with_staging_account else [])
     if args.with_account:
         root_id, mgmt_email = aws_preflight(args.profile, name)
         config_preflight(name, envs)
-        r = run(["aws", "configure", "get", "region",
-                 "--profile", args.profile], check=False)
-        region = r.stdout.strip() or "us-west-2"
+        if not args.region:
+            r = run(["aws", "configure", "get", "region",
+                     "--profile", args.profile], check=False)
+            region = r.stdout.strip() or "us-west-2"
+    if args.with_account or args.with_cdk:
+        print(f"  ok: deploying to region {region}")
     cdk_cmd = fresh = None
     if args.with_cdk:
         cdk_cmd, fresh = cdk_preflight(cwd, args.dry_run)
@@ -812,14 +841,15 @@ def cmd_onboard(args):
     if args.with_account:
         ids = do_aws(plan, args.profile, name, root_id, emails, envs, region)
     if args.with_cdk:
-        do_cdk(plan, cwd, name, ids, envs, region, lang, args.with_account,
+        do_cdk(plan, cwd, owner, name, ids, envs, region, lang,
+               args.with_account,
                args.with_ci, cdk_cmd, fresh, holder)
     if args.with_ci:
         do_ci(plan, cwd, name, ids, envs, region, lang, cdk_cmd, fresh,
               holder)
-    do_docs(plan, name, cwd, sel, ids, envs, region, holder)
+    do_docs(plan, owner, name, cwd, sel, ids, envs, region, holder)
     if args.with_repo:
-        do_repo(plan, name, cwd, visibility, description)
+        do_repo(plan, owner, name, cwd, visibility, description)
 
     print(f"\n{'Dry run complete; no changes made.' if args.dry_run else 'Done.'}")
 
@@ -832,7 +862,7 @@ def main():
         "onboard", help="stand up a new project",
         description="With no --with-* flags, prompts for each step.")
     p.add_argument("--with-repo", action="store_true",
-                   help=f"create GitHub repo under '{GITHUB_OWNER}' and push")
+                   help="create the GitHub repo and push")
     p.add_argument("--with-account", action="store_true",
                    help="create an Organizations OU, a prod account, and "
                         "a matching ~/.aws/config profile")
@@ -847,8 +877,14 @@ def main():
                    help="GitHub OIDC deploy roles + deploy.yml workflow "
                         "(requires repo, account, and cdk)")
     p.add_argument("--name", help="project name (default: folder name)")
+    p.add_argument("--owner", metavar="OWNER",
+                   help="GitHub user or organization to create the repo "
+                        "under (default: the authenticated gh user)")
     p.add_argument("--profile", default="default",
-                   help="AWS profile to use (default: default)")
+                   help="management-account AWS profile (default: default)")
+    p.add_argument("--region", metavar="REGION",
+                   help="deploy region (default: the management profile's "
+                        "region, else us-west-2)")
     p.add_argument("--dry-run", action="store_true",
                    help="print planned changes without making them")
     p.add_argument("--yes", action="store_true",

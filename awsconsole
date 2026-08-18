@@ -1,0 +1,380 @@
+#!/usr/bin/env python3
+"""awsconsole - open the AWS web console for an account you can reach.
+
+Usage:
+  awsconsole [options] <account>
+  awsconsole --list
+
+Accounts come from two sources, merged:
+
+  organizations  Every active member account in the organization reachable
+                 from the management profile, named as Organizations names
+                 them. Reached by assuming a role in the target account
+                 (default OrganizationAccountAccessRole).
+  ~/.aws/config  Every profile carrying an account id: an SSO profile
+                 (sso_account_id) or an assume-role profile (account id read
+                 out of role_arn). Reached through the profile itself, so SSO,
+                 role chaining and credential_process all work.
+
+An account present in both is reached through its profile, since that is the
+explicit choice and may carry a narrower role than the org-wide one.
+
+Matching is case-insensitive against both the Organizations account name and
+the profile name, and a unique substring is enough ("poker" matches
+"FreePokerTable.com").
+
+No AWS Organization is required: if the management profile cannot read
+Organizations, only ~/.aws/config profiles are offered.
+
+Options:
+  --list             list known accounts and exit
+  --print-url        print the sign-in URL instead of opening a browser
+  --profile PROFILE  management profile for the Organizations lookup
+                     [$AWSCONSOLE_PROFILE, else "default"]
+  --role NAME        role to assume in org accounts that have no profile
+                     [$AWSCONSOLE_ROLE, else OrganizationAccountAccessRole;
+                     Control Tower organizations usually use
+                     AWSControlTowerExecution]
+  --region REGION    console region [$AWSCONSOLE_REGION, else the region of
+                     the profile used, else $AWS_DEFAULT_REGION, else
+                     us-east-1]
+
+The sign-in URL grants console access to anyone holding it, so it is not
+printed unless --print-url is given.
+
+Requires: python3, aws CLI v2 (2.13+ for 'configure export-credentials').
+Commercial AWS partition only; GovCloud and China use different sign-in
+endpoints.
+"""
+
+import argparse
+import configparser
+import json
+import os
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+DEFAULT_ROLE = "OrganizationAccountAccessRole"
+FEDERATION_ENDPOINT = "https://signin.aws.amazon.com/federation"
+ROLE_ARN_ACCOUNT = re.compile(r"^arn:[^:]*:iam::(\d{12}):role/")
+# Only used when a profile yields long-lived keys instead of a session.
+LONG_TERM_SESSION_SECONDS = 43200
+
+
+# ---------------------------------------------------------------- utilities
+
+def run(cmd):
+    """Run a command, capturing output; never raises on non-zero exit."""
+    return subprocess.run(cmd, capture_output=True, text=True, check=False)
+
+
+def die(msg):
+    print(f"awsconsole: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def warn(msg):
+    print(f"awsconsole: {msg}", file=sys.stderr)
+
+
+# ------------------------------------------------------------- account list
+#
+# A candidate is {id, name, profile, sso, aliases}: "profile" is the config
+# profile to get credentials from, or None to assume the org role instead;
+# "aliases" holds every lowercased string the account answers to.
+
+def aws_config_path():
+    override = os.environ.get("AWS_CONFIG_FILE")
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".aws" / "config"
+
+
+def config_candidates():
+    """Profiles in ~/.aws/config whose account id is knowable without a call."""
+    path = aws_config_path()
+    if not path.exists():
+        return []
+    parser = configparser.RawConfigParser()
+    try:
+        parser.read(path)
+    except configparser.Error as exc:
+        warn(f"could not parse {path}: {exc}")
+        return []
+
+    out = []
+    for section in parser.sections():
+        # Anything else ([sso-session x], [services x]) is not a profile.
+        if section == "default":
+            name = "default"
+        elif section.startswith("profile "):
+            name = section[len("profile "):].strip()
+        else:
+            continue
+
+        values = parser[section]
+        account = values.get("sso_account_id", "").strip()
+        sso = bool(account)
+        if not account:
+            match = ROLE_ARN_ACCOUNT.match(values.get("role_arn", "").strip())
+            account = match.group(1) if match else ""
+        if not account:
+            continue
+
+        out.append({"id": account, "name": name, "profile": name,
+                    "sso": sso, "aliases": {name.lower()}})
+    return out
+
+
+def org_candidates(profile):
+    """Active org member accounts, or None if the org cannot be read."""
+    org = run(["aws", "organizations", "describe-organization",
+               "--profile", profile, "--output", "json"])
+    if org.returncode != 0:
+        return None, org.stderr.strip()
+    mgmt = json.loads(org.stdout)["Organization"]["MasterAccountId"]
+
+    # The CLI paginates list-accounts for us.
+    listed = run(["aws", "organizations", "list-accounts",
+                  "--profile", profile, "--output", "json"])
+    if listed.returncode != 0:
+        return None, listed.stderr.strip()
+
+    out = []
+    for account in json.loads(listed.stdout)["Accounts"]:
+        # The management account cannot be reached by assuming into itself;
+        # if it has a profile, that profile supplies it instead.
+        if account["Status"] != "ACTIVE" or account["Id"] == mgmt:
+            continue
+        out.append({"id": account["Id"], "name": account["Name"],
+                    "profile": None, "sso": False,
+                    "aliases": {account["Name"].lower()}})
+    return out, None
+
+
+def merge(org, config):
+    """Org names win for display; config profiles win for credentials."""
+    by_id = {}
+    for candidate in org:
+        by_id[candidate["id"]] = candidate
+    for candidate in config:
+        existing = by_id.get(candidate["id"])
+        if existing is None:
+            by_id[candidate["id"]] = candidate
+        else:
+            existing["profile"] = candidate["profile"]
+            existing["sso"] = candidate["sso"]
+            existing["aliases"] |= candidate["aliases"]
+    return sorted(by_id.values(), key=lambda c: c["name"].lower())
+
+
+def collect(profile):
+    config = config_candidates()
+    org, error = org_candidates(profile)
+    if org is None:
+        warn(f"organizations lookup via profile '{profile}' failed, "
+             f"listing ~/.aws/config profiles only")
+        if error:
+            for line in error.splitlines():
+                warn(f"  {line}")
+        org = []
+    candidates = merge(org, config)
+    if not candidates:
+        die(f"no accounts found: profile '{profile}' cannot read "
+            f"Organizations and {aws_config_path()} has no profile with an "
+            f"sso_account_id or role_arn")
+    return candidates
+
+
+def describe(candidate):
+    if candidate["profile"]:
+        how = f"profile {candidate['profile']}"
+        if candidate["profile"] != candidate["name"]:
+            return f"{candidate['name']}  {candidate['id']}  ({how})"
+        return f"{candidate['name']}  {candidate['id']}  (profile)"
+    return f"{candidate['name']}  {candidate['id']}  (assume role)"
+
+
+def print_accounts(candidates):
+    print("accounts:", file=sys.stderr)
+    for candidate in candidates:
+        print(f"  {describe(candidate)}", file=sys.stderr)
+
+
+def match(candidates, query):
+    """Exact name match wins; otherwise every substring hit."""
+    wanted = query.lower()
+    exact = [c for c in candidates if wanted in c["aliases"]]
+    if exact:
+        return exact
+    return [c for c in candidates
+            if any(wanted in alias for alias in c["aliases"])]
+
+
+# ------------------------------------------------------------- credentials
+
+def credentials_via_profile(profile, sso):
+    """Uses the CLI's own resolution: SSO, role chaining, credential_process."""
+    cmd = ["aws", "configure", "export-credentials",
+           "--profile", profile, "--format", "process"]
+    result = run(cmd)
+    if result.returncode != 0 or not result.stdout.strip():
+        if not sso:
+            die(f"could not get credentials for profile '{profile}':\n"
+                f"{result.stderr.strip()}")
+        # Missing or expired SSO token: log in, then retry once.
+        warn(f"refreshing SSO login for profile '{profile}'")
+        if subprocess.run(["aws", "sso", "login", "--profile", profile],
+                          check=False).returncode != 0:
+            die(f"aws sso login failed for profile '{profile}'")
+        result = run(cmd)
+        if result.returncode != 0 or not result.stdout.strip():
+            die(f"could not get credentials for profile '{profile}':\n"
+                f"{result.stderr.strip()}")
+    return json.loads(result.stdout)
+
+
+def credentials_via_assume_role(profile, account, role):
+    result = run(["aws", "sts", "assume-role",
+                  "--role-arn", f"arn:aws:iam::{account}:role/{role}",
+                  "--role-session-name", "awsconsole",
+                  "--profile", profile,
+                  "--query", "Credentials", "--output", "json"])
+    if result.returncode != 0:
+        die(f"could not assume {role} in account {account} using profile "
+            f"'{profile}':\n{result.stderr.strip()}\n"
+            f"(if this organization was set up by Control Tower, try "
+            f"--role AWSControlTowerExecution)")
+    return json.loads(result.stdout)
+
+
+def signin_token(creds):
+    session = {"sessionId": creds["AccessKeyId"],
+               "sessionKey": creds["SecretAccessKey"]}
+    params = {"Action": "getSigninToken"}
+    if creds.get("SessionToken"):
+        session["sessionToken"] = creds["SessionToken"]
+    else:
+        # Long-lived IAM user keys: the endpoint wants an explicit duration
+        # instead of a session token.
+        params["SessionDuration"] = str(LONG_TERM_SESSION_SECONDS)
+    params["Session"] = json.dumps(session)
+    url = f"{FEDERATION_ENDPOINT}?{urllib.parse.urlencode(params)}"
+    try:
+        with urllib.request.urlopen(url, timeout=30) as response:
+            return json.load(response)["SigninToken"]
+    except urllib.error.HTTPError as exc:
+        die(f"federation endpoint returned {exc.code}: "
+            f"{exc.read().decode('utf-8', 'replace').strip()}")
+    except urllib.error.URLError as exc:
+        die(f"could not reach the federation endpoint: {exc.reason}")
+
+
+def console_url(token, region):
+    destination = (f"https://{region}.console.aws.amazon.com/console/home"
+                   f"?region={region}")
+    params = {"Action": "login", "Issuer": "awsconsole",
+              "Destination": destination, "SigninToken": token}
+    return f"{FEDERATION_ENDPOINT}?{urllib.parse.urlencode(params)}"
+
+
+def open_url(url):
+    opener = "open" if platform.system() == "Darwin" else "xdg-open"
+    if shutil.which(opener) is None:
+        return False
+    subprocess.run([opener, url], check=False)
+    return True
+
+
+# --------------------------------------------------------------------- main
+
+def resolve_region(explicit, profile):
+    if explicit:
+        return explicit
+    if profile:
+        result = run(["aws", "configure", "get", "region",
+                      "--profile", profile])
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    return (os.environ.get("AWS_DEFAULT_REGION")
+            or os.environ.get("AWS_REGION") or "us-east-1")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="awsconsole", add_help=True,
+        description="Open the AWS web console for an account you can reach.")
+    parser.add_argument("account", nargs="?",
+                        help="account name, profile name, or unique substring")
+    parser.add_argument("--list", action="store_true",
+                        help="list known accounts and exit")
+    parser.add_argument("--print-url", action="store_true",
+                        help="print the sign-in URL instead of opening it")
+    parser.add_argument("--profile",
+                        default=os.environ.get("AWSCONSOLE_PROFILE", "default"),
+                        help="management profile for the Organizations lookup")
+    parser.add_argument("--role",
+                        default=os.environ.get("AWSCONSOLE_ROLE", DEFAULT_ROLE),
+                        help="role to assume in org accounts without a profile")
+    parser.add_argument("--region",
+                        default=os.environ.get("AWSCONSOLE_REGION"),
+                        help="console region")
+    args = parser.parse_args()
+
+    if shutil.which("aws") is None:
+        die("required tool not found on PATH: aws")
+
+    candidates = collect(args.profile)
+
+    if args.list:
+        for candidate in candidates:
+            print(describe(candidate))
+        return
+    if not args.account:
+        print("usage: awsconsole <account>", file=sys.stderr)
+        print_accounts(candidates)
+        sys.exit(1)
+
+    matches = match(candidates, args.account)
+    if not matches:
+        warn(f"no account matching '{args.account}'")
+        print_accounts(candidates)
+        sys.exit(1)
+    if len(matches) > 1:
+        warn(f"'{args.account}' is ambiguous:")
+        for candidate in matches:
+            print(f"  {describe(candidate)}", file=sys.stderr)
+        sys.exit(1)
+
+    target = matches[0]
+    print(f"opening console for {target['name']} ({target['id']})",
+          file=sys.stderr)
+
+    if target["profile"]:
+        creds = credentials_via_profile(target["profile"], target["sso"])
+    else:
+        creds = credentials_via_assume_role(args.profile, target["id"],
+                                            args.role)
+
+    # Accounts reached by assuming a role have no profile of their own; the
+    # management profile's region is a better guess than a fixed default.
+    region = resolve_region(args.region, target["profile"] or args.profile)
+    url = console_url(signin_token(creds), region)
+
+    if args.print_url:
+        print(url)
+        return
+    if not open_url(url):
+        warn("no browser opener found; re-run with --print-url")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
