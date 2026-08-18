@@ -86,6 +86,21 @@ each new account. Python apps additionally get a `.venv` with
 dependencies installed and `cdk.json` pointed at `.venv/bin/python`, so
 nothing requires venv activation.
 
+TypeScript and Python are the only supported languages. `cdk init app`
+itself also offers javascript, go, java, csharp and fsharp, but awstool
+does more than run it: it generates an env module, rewrites the app
+entrypoint, writes the OIDC stack, and parses the generated source to
+find the stack class, all in the project's language. That is a set of
+code generators per language rather than a list entry, so the supported
+set is deliberately small.
+
+For another language, run `cdk init` yourself and use awstool for
+`--with-repo` and `--with-account`. You get the repo, the OU, the
+accounts and the `~/.aws/config` profiles; bootstrap each account
+(`cdk bootstrap aws://<account-id>/<region> --profile <name>-<env>`) and
+wire the deploy role and workflow by hand. `--with-cdk` and `--with-ci`
+assume TypeScript or Python and will fail on other languages.
+
 **ci** - generate a `GithubOidcStack` (GitHub OIDC provider plus a
 `GitHubDeployRole` that trusts only this repo and can only assume the
 `cdk-*` bootstrap roles), deploy it to each account, and write

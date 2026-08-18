@@ -605,7 +605,10 @@ def do_cdk(plan, cwd, owner, name, ids, envs, region, lang, with_account,
             pkg, module, klass = "<package>", "<stack-module>", "<AppStack>"
         else:
             die("could not locate the generated app stack ("
-                + ("lib/*-stack.ts" if ts else "*/*_stack.py") + ")")
+                + ("lib/*-stack.ts" if ts else "*/*_stack.py") + "); "
+                "--with-cdk handles TypeScript and Python apps only. For "
+                "an app in another language, skip --with-cdk and --with-ci "
+                "and bootstrap the accounts by hand.")
     holder["stack_class"] = klass
 
     if with_account:
