@@ -756,7 +756,7 @@ def cmd_onboard(args):
         if args.with_account:
             args.with_staging_account = confirm(
                 "Also create a staging account?")
-        args.with_cdk = confirm("Initialize a CDK app (TypeScript)?")
+        args.with_cdk = confirm("Initialize a CDK app?")
         if args.with_cdk and args.with_account and args.with_repo:
             args.with_ci = confirm(
                 "Set up GitHub Actions deploys (OIDC roles + workflow)?")

@@ -22,9 +22,14 @@ Run with no flags to be prompted for each step:
 Create GitHub repo? [y/N]
 Create AWS OU + prod account? [y/N]
 Also create a staging account? [y/N]
-Initialize a CDK app (TypeScript)? [y/N]
+Initialize a CDK app? [y/N]
 Set up GitHub Actions deploys (OIDC roles + workflow)? [y/N]
 ```
+
+Once the steps are chosen and preflight has passed, it prompts for the
+details each one needs: repo visibility and description, CDK language
+(typescript or python, defaulting to typescript), and an email address
+per AWS account.
 
 Or select steps with flags: `--with-repo`, `--with-account`,
 `--with-staging-account`, `--with-cdk` (plus `--cdk-language ts|py`),
