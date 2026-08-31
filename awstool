@@ -252,6 +252,7 @@ DEPLOY_ENVS = {{
 
 
 def oidc_py(repo):
+    owner, _, name = repo.partition("/")
     return f'''from aws_cdk import CfnOutput, Stack
 from aws_cdk import aws_iam as iam
 from constructs import Construct
@@ -281,9 +282,21 @@ class GithubOidcStack(Stack):
                         "token.actions.githubusercontent.com:aud":
                             "sts.amazonaws.com",
                     }},
+                    # Two forms. GitHub issues an ID-qualified subject
+                    # claim -- repo:owner@1197077/name@1351835579:ref:... --
+                    # not the plain repo:owner/name:... that most examples
+                    # show. A pattern written for the plain form cannot match
+                    # it, because what follows the owner is "@<id>" rather
+                    # than "/", and STS rejects it with a bare "Not authorized
+                    # to perform sts:AssumeRoleWithWebIdentity" naming no
+                    # cause. Listing both works whichever GitHub sends. Only
+                    # the numeric ids are wildcarded; the owner and repo names
+                    # stay pinned.
                     "StringLike": {{
-                        "token.actions.githubusercontent.com:sub":
+                        "token.actions.githubusercontent.com:sub": [
                             "repo:{repo}:*",
+                            "repo:{owner}@*/{name}@*:*",
+                        ],
                     }},
                 }},
             ),
@@ -337,6 +350,7 @@ export const envs: Record<string, DeployEnv> = {{
 
 
 def oidc_ts(repo):
+    owner, _, name = repo.partition("/")
     return f"""import * as cdk from 'aws-cdk-lib';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import {{ Construct }} from 'constructs';
@@ -361,7 +375,19 @@ export class GithubOidcStack extends cdk.Stack {{
             'token.actions.githubusercontent.com:aud': 'sts.amazonaws.com',
           }},
           StringLike: {{
-            'token.actions.githubusercontent.com:sub': 'repo:{repo}:*',
+            // Two forms. GitHub issues an ID-qualified subject claim --
+            //   repo:owner@1197077/name@1351835579:ref:refs/heads/main
+            // -- not the plain repo:owner/name:... that most examples show. A
+            // pattern written for the plain form cannot match it, because what
+            // follows the owner is '@<id>' rather than '/', and STS rejects it
+            // with a bare "Not authorized to perform
+            // sts:AssumeRoleWithWebIdentity" that names no cause. Listing both
+            // works whichever GitHub sends. Only the numeric ids are
+            // wildcarded; the owner and repo names stay pinned.
+            'token.actions.githubusercontent.com:sub': [
+              'repo:{repo}:*',
+              'repo:{owner}@*/{name}@*:*',
+            ],
           }},
         }},
       ),
