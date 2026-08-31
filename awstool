@@ -38,6 +38,7 @@ import json
 import re
 import shutil
 import subprocess
+import tempfile
 import sys
 import time
 from pathlib import Path
@@ -49,10 +50,10 @@ AWS_CONFIG_PATH = Path.home() / ".aws" / "config"
 
 # ---------------------------------------------------------------- utilities
 
-def run(cmd, capture=True, check=True):
+def run(cmd, capture=True, check=True, cwd=None):
     """Run a command; return CompletedProcess."""
     return subprocess.run(
-        cmd, capture_output=capture, text=True, check=check
+        cmd, capture_output=capture, text=True, check=check, cwd=cwd
     )
 
 
@@ -91,15 +92,18 @@ class Plan:
         self.dry_run = dry_run
         self._n = 0
 
-    def execute(self, description, cmd=None, fn=None, detail=None):
+    def execute(self, description, cmd=None, fn=None, detail=None,
+                cwd=None):
         """cmd: a CLI command list. fn: a python callable (for composite
         steps like poll loops). detail: extra text to display (e.g. file
-        content to be written). Returns CompletedProcess/fn result, or None
+        content to be written). cwd: directory to run cmd in, shown in the
+        dry-run transcript. Returns CompletedProcess/fn result, or None
         in dry-run."""
         self._n += 1
         print(f"\n[{self._n}] {description}")
         if cmd is not None:
-            print(f"    $ {shell_repr(cmd)}")
+            prefix = f"cd {cwd.name} && " if cwd is not None else ""
+            print(f"    $ {prefix}{shell_repr(cmd)}")
         if detail:
             for line in detail.rstrip("\n").splitlines():
                 print(f"    | {line}")
@@ -108,7 +112,7 @@ class Plan:
             return None
         if fn is not None:
             return fn()
-        return run(cmd, capture=False)
+        return run(cmd, capture=False, cwd=cwd)
 
 
 # ---------------------------------------------------------------- preflight
@@ -190,27 +194,35 @@ def config_preflight(name, envs):
     print(f"  ok: no profile name collisions in {AWS_CONFIG_PATH}")
 
 
-def cdk_preflight(cwd, dry_run):
-    """Returns (cdk_cmd, fresh) where fresh means cdk init will run."""
+def cdk_preflight(infra, dry_run):
+    """Returns (cdk_cmd, fresh) where fresh means cdk init will run.
+
+    The CDK app lives in an infra/ subdirectory. 'cdk init' refuses to run
+    in a directory holding any visible file, so initializing at the project
+    root would force the repo to be empty of application code.
+    """
     check_binaries(["node", "npx"])
     if run(["which", "cdk"], check=False).returncode == 0:
         cdk_cmd = ["cdk"]
     else:
         cdk_cmd = ["npx", "-y", "aws-cdk"]
-    fresh = not (cwd / "cdk.json").exists()
+    fresh = not (infra / "cdk.json").exists()
     if fresh:
-        clutter = [p.name for p in cwd.iterdir()
-                   if not p.name.startswith(".")]
+        clutter = ([p.name for p in infra.iterdir()
+                    if not p.name.startswith(".")]
+                   if infra.is_dir() else [])
         if clutter:
-            msg = (f"'cdk init' needs an empty directory, but {cwd} "
+            msg = (f"'cdk init' needs an empty directory, but {infra} "
                    f"contains: {', '.join(sorted(clutter)[:5])}")
             if dry_run:
                 print(f"  warn: {msg}")
             else:
                 die(msg)
-        print(f"  ok: cdk available ({' '.join(cdk_cmd)}); will run cdk init")
+        print(f"  ok: cdk available ({' '.join(cdk_cmd)}); "
+              f"will run cdk init in {infra.name}/")
     else:
-        print("  ok: existing CDK app detected (cdk.json); will skip init")
+        print(f"  ok: existing CDK app detected ({infra.name}/cdk.json); "
+              "will skip init")
     return cdk_cmd, fresh
 
 
@@ -407,6 +419,9 @@ def workflow_yml(ids, envs, region, stack_class, lang):
         return f"""  deploy-{env}:
     if: {condition}
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infra
     steps:
       - uses: actions/checkout@v4
 {setup}      - uses: aws-actions/configure-aws-credentials@v4
@@ -566,30 +581,59 @@ def do_aws(plan, profile, name, root_id, emails, envs, region):
     return ids
 
 
-def do_cdk(plan, cwd, owner, name, ids, envs, region, lang, with_account,
+def do_cdk(plan, infra, owner, name, ids, envs, region, lang, with_account,
            with_ci, cdk_cmd, fresh, holder):
     ts = lang == "typescript"
     if fresh:
+        def init_app():
+            # 'cdk init' names the package, stack file and stack class
+            # after the directory it runs in, so running it straight in
+            # infra/ would name every project's stack InfraStack. Stage it
+            # in a scratch directory named for the project instead, then
+            # move the tree into place. The scratch root is a sibling of
+            # infra/ so the move is a same-filesystem rename rather than a
+            # copy of node_modules. 'cdk init' also runs 'git init'; that
+            # .git is deliberately left behind, since nested inside the
+            # outer repo it would make infra/ an empty gitlink and none of
+            # the CDK app would be tracked.
+            infra.mkdir(parents=True, exist_ok=True)
+            scratch = tempfile.mkdtemp(dir=str(infra.parent),
+                                       prefix=".awstool-cdk-init-")
+            try:
+                staged = Path(scratch) / name
+                staged.mkdir()
+                run(cdk_cmd + ["init", "app", "--language", lang],
+                    capture=False, cwd=staged)
+                for item in staged.iterdir():
+                    if item.name == ".git":
+                        continue
+                    shutil.move(str(item), str(infra / item.name))
+            finally:
+                shutil.rmtree(scratch, ignore_errors=True)
+
         plan.execute(
-            f"Initialize CDK {lang} app"
+            f"Initialize CDK {lang} app in {infra.name}/, named for "
+            f"'{name}' rather than the directory"
             + (" (also runs npm install)" if ts else ""),
-            cmd=cdk_cmd + ["init", "app", "--language", lang])
+            cmd=cdk_cmd + ["init", "app", "--language", lang],
+            cwd=infra, fn=init_app)
 
     if not ts and fresh:
         plan.execute(
             "Create .venv and install CDK python dependencies",
             cmd=["sh", "-c", "python3 -m venv .venv && "
                  ".venv/bin/pip install -r requirements.txt"],
-            fn=lambda: (run(["python3", "-m", "venv", ".venv"]),
+            cwd=infra,
+            fn=lambda: (run(["python3", "-m", "venv", ".venv"], cwd=infra),
                         run([".venv/bin/pip", "install", "-r",
-                             "requirements.txt"])))
+                             "requirements.txt"], cwd=infra)))
 
         def patch_cdk_json():
-            path = cwd / "cdk.json"
+            path = infra / "cdk.json"
             data = json.loads(path.read_text())
             data["app"] = ".venv/bin/python app.py"
             path.write_text(json.dumps(data, indent=2) + "\n")
-            gitignore = cwd / ".gitignore"
+            gitignore = infra / ".gitignore"
             text = gitignore.read_text() if gitignore.exists() else ""
             if ".venv" not in text:
                 gitignore.write_text(text + ".venv/\n")
@@ -599,7 +643,7 @@ def do_cdk(plan, cwd, owner, name, ids, envs, region, lang, with_account,
 
     # locate the stack cdk init generated (placeholders when dry-run
     # skipped the init that would have created it)
-    pkg, module, klass = detect_stack(cwd, lang)
+    pkg, module, klass = detect_stack(infra, lang)
     if klass is None:
         if plan.dry_run:
             pkg, module, klass = "<package>", "<stack-module>", "<AppStack>"
@@ -612,8 +656,8 @@ def do_cdk(plan, cwd, owner, name, ids, envs, region, lang, with_account,
     holder["stack_class"] = klass
 
     if with_account:
-        env_path = (cwd / "lib" / "env.ts" if ts
-                    else cwd / pkg / "deploy_env.py")
+        env_path = (infra / "lib" / "env.ts" if ts
+                    else infra / pkg / "deploy_env.py")
         if env_path.exists():
             print(f"    note: {env_path} exists; leaving it alone")
         else:
@@ -625,8 +669,8 @@ def do_cdk(plan, cwd, owner, name, ids, envs, region, lang, with_account,
                                       env_path.write_text(c)))
 
     if with_ci:
-        oidc_path = (cwd / "lib" / "github-oidc-stack.ts" if ts
-                     else cwd / pkg / "github_oidc_stack.py")
+        oidc_path = (infra / "lib" / "github-oidc-stack.ts" if ts
+                     else infra / pkg / "github_oidc_stack.py")
         if oidc_path.exists():
             print(f"    note: {oidc_path} exists; leaving it alone")
         else:
@@ -642,7 +686,7 @@ def do_cdk(plan, cwd, owner, name, ids, envs, region, lang, with_account,
             content = bin_ts(module, klass, with_ci)
 
             def write_entry(c=content):
-                files = sorted((cwd / "bin").glob("*.ts"))
+                files = sorted((infra / "bin").glob("*.ts"))
                 if not files:
                     die("could not find bin/*.ts after cdk init")
                 files[0].write_text(c)
@@ -650,7 +694,7 @@ def do_cdk(plan, cwd, owner, name, ids, envs, region, lang, with_account,
             content = app_py(pkg, module, klass, with_ci)
 
             def write_entry(c=content):
-                (cwd / "app.py").write_text(c)
+                (infra / "app.py").write_text(c)
 
         plan.execute(
             f"Rewrite {'bin entrypoint' if ts else 'app.py'}: one "
@@ -667,17 +711,20 @@ def do_cdk(plan, cwd, owner, name, ids, envs, region, lang, with_account,
             plan.execute(
                 f"Bootstrap CDK in the {env} account",
                 cmd=cdk_cmd + ["bootstrap", f"aws://{ids[env]}/{region}",
-                               "--profile", f"{name.lower()}-{env}"])
+                               "--profile", f"{name.lower()}-{env}"],
+                cwd=infra)
 
 
-def do_ci(plan, cwd, name, ids, envs, region, lang, cdk_cmd, fresh, holder):
+def do_ci(plan, cwd, infra, name, ids, envs, region, lang, cdk_cmd, fresh,
+          holder):
     if fresh:
         for env in envs:
             plan.execute(
                 f"Deploy GithubOidc-{env} (GitHub Actions deploy role)",
                 cmd=cdk_cmd + ["deploy", f"GithubOidc-{env}",
                                "--profile", f"{name.lower()}-{env}",
-                               "--require-approval", "never"])
+                               "--require-approval", "never"],
+                cwd=infra)
     else:
         print("    note: once GithubOidcStack is wired into your app, "
               "deploy it per env: cdk deploy GithubOidc-<env> "
@@ -715,9 +762,9 @@ def do_docs(plan, owner, name, cwd, sel, ids, envs, region, holder):
     if sel["cdk"] and sel["account"]:
         stack = holder.get("stack_class", "<AppStack>")
         cdk_bin = "npx cdk" if sel["lang"] == "typescript" else "cdk"
-        lines.append(f"- Deploy by hand: `{cdk_bin} deploy {stack}-staging "
-                     f"--profile {name.lower()}-staging` (both accounts "
-                     f"are already CDK-bootstrapped)")
+        lines.append(f"- Deploy by hand: `cd infra && {cdk_bin} deploy "
+                     f"{stack}-staging --profile {name.lower()}-staging` "
+                     f"(both accounts are already CDK-bootstrapped)")
     if sel["ci"]:
         lines += [
             "- CI: push to main deploys staging; deploy prod with "
@@ -745,6 +792,7 @@ def do_docs(plan, owner, name, cwd, sel, ids, envs, region, holder):
 
 def cmd_onboard(args):
     cwd = Path.cwd()
+    infra = cwd / "infra"
     name = args.name or cwd.name
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name):
         die(f"'{name}' is not usable as a repo/OU name; pass --name")
@@ -800,7 +848,7 @@ def cmd_onboard(args):
         print(f"  ok: deploying to region {region}")
     cdk_cmd = fresh = None
     if args.with_cdk:
-        cdk_cmd, fresh = cdk_preflight(cwd, args.dry_run)
+        cdk_cmd, fresh = cdk_preflight(infra, args.dry_run)
 
     # ---- gather inputs ----
     visibility = description = None
@@ -844,12 +892,12 @@ def cmd_onboard(args):
     if args.with_account:
         ids = do_aws(plan, args.profile, name, root_id, emails, envs, region)
     if args.with_cdk:
-        do_cdk(plan, cwd, owner, name, ids, envs, region, lang,
+        do_cdk(plan, infra, owner, name, ids, envs, region, lang,
                args.with_account,
                args.with_ci, cdk_cmd, fresh, holder)
     if args.with_ci:
-        do_ci(plan, cwd, name, ids, envs, region, lang, cdk_cmd, fresh,
-              holder)
+        do_ci(plan, cwd, infra, name, ids, envs, region, lang, cdk_cmd,
+              fresh, holder)
     do_docs(plan, owner, name, cwd, sel, ids, envs, region, holder)
     if args.with_repo:
         do_repo(plan, owner, name, cwd, visibility, description)
