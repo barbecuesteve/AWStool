@@ -78,13 +78,27 @@ hard-to-undo step, so it gets its own confirmation: AWS accounts can only
 be closed, not deleted, and closed accounts count against org quotas for
 90 days.
 
-**cdk** - `cdk init app` in TypeScript or Python (skipped if `cdk.json`
-exists), pin each environment's account/region in a generated env module
-(`lib/env.ts` or `<package>/deploy_env.py`), rewrite the app entrypoint
-to instantiate one env-pinned stack per environment, and `cdk bootstrap`
-each new account. Python apps additionally get a `.venv` with
-dependencies installed and `cdk.json` pointed at `.venv/bin/python`, so
-nothing requires venv activation.
+**cdk** - `cdk init app` in TypeScript or Python into an **`infra/`
+subdirectory** (skipped if `infra/cdk.json` exists), pin each
+environment's account/region in a generated env module
+(`infra/lib/env.ts` or `infra/<package>/deploy_env.py`), rewrite the app
+entrypoint to instantiate one env-pinned stack per environment, and
+`cdk bootstrap` each new account. Python apps additionally get a `.venv`
+with dependencies installed and `cdk.json` pointed at `.venv/bin/python`,
+so nothing requires venv activation.
+
+The CDK app lives in `infra/` rather than the repo root because
+`cdk init` refuses to run in a directory containing any visible file --
+at the root it would force the repo to be empty of application code, so
+you could never add CDK to an existing project. Two consequences are
+handled for you. `cdk init` names the package, stack file and stack class
+after the directory it runs in, which would name every project's stack
+`InfraStack`; awstool stages the init in a scratch directory named for
+the project, so you get `AcmeStack` in `infra/lib/acme-stack.ts`. And
+`cdk init` runs `git init`, which nested inside the outer repo would
+record `infra/` as an empty gitlink and track none of the CDK app; that
+`.git` is discarded. Generated CI runs every step with
+`working-directory: infra`.
 
 TypeScript and Python are the only supported languages. `cdk init app`
 itself also offers javascript, go, java, csharp and fsharp, but awstool
@@ -116,8 +130,8 @@ initial commit.
 Before doing anything (including in dry-run) the tool verifies: required
 CLIs on PATH, `gh` authenticated and the repo name available under the
 resolved owner, the AWS profile belongs to the org management account, no
-OU or `~/.aws/config` profile name collisions, and (for cdk) an empty
-directory or an existing `cdk.json`. The region in use is printed before
+OU or `~/.aws/config` profile name collisions, and (for cdk) an absent
+or empty `infra/` directory, or an existing `infra/cdk.json`. The region in use is printed before
 any work starts.
 
 ## Prerequisites
